@@ -51,7 +51,12 @@ def test_reused_frames_keep_archive_numbers_and_new_frames_append(db):
         (120, 150, 20, 50, False),
         (150, 180, 50, 80, True),
     ]
-    assert [s["arch_start"] for s in report["shots"][0]["segments"]] == [20, 50]
+    # Both pieces keep the same original->archive offset (orig 120 -> arch
+    # 20), so the shot reads as one continuous archive block [20, 80) even
+    # though the manifest still distinguishes reuse from the new copy.
+    assert [s["arch_start"] for s in report["shots"][0]["segments"]] == [20]
+    assert report["shots"][0]["segments"][0]["orig_start"] == 120
+    assert report["shots"][0]["segments"][0]["orig_end"] == 180
     assert reel_state(db, "R001")["next_frame"] == 80
 
 
@@ -94,9 +99,10 @@ def test_later_row_reusing_earlier_row_copies_marks_reuse_not_new(db):
         (0, 150, 0, True)
     ]
     segs = report["shots"][1]["segments"]
+    # Both rows land contiguously on the same archive reel (constant offset
+    # 0), so shot 2 reads back as one continuous block despite two index rows.
     assert [(s["orig_start"], s["orig_end"], s["arch_start"]) for s in segs] == [
-        (50, 100, 50),
-        (100, 150, 100),
+        (50, 150, 50),
     ]
     assert reel_state(db, "R001")["next_frame"] == 150
 
@@ -210,9 +216,10 @@ def test_three_order_chain_reuses_every_existing_frame(db):
     report = submit(db, "O3", [row(1, "S01", "R001", 0, 200)])
     assert all(not c["is_new"] for c in report["copies"])
     assert reel_state(db, "R001")["next_frame"] == 200
+    # The two index rows are contiguous in both frame spaces, so the shot is
+    # one continuous archive read instead of two small pieces.
     assert [(s["arch_start"], s["arch_end"]) for s in report["shots"][0]["segments"]] == [
-        (0, 100),
-        (100, 200),
+        (0, 200),
     ]
 
 
@@ -220,3 +227,110 @@ def test_empty_and_invalid_rows_rejected(db):
     for rows in ([], [row(1, "S01", "R001", 0, 0)]):
         with pytest.raises(SubmissionError):
             submit(db, "OX", rows)
+
+
+def test_contiguous_index_rows_read_as_one_piece_not_per_index_row(db):
+    # Many small adjacent orders build a coverage index with one row per
+    # order, but the original->archive offset stays constant.  A later shot
+    # spanning all of them must read one continuous block, not one piece per
+    # index entry.
+    for k in range(20):
+        submit(db, f"OLD{k}", [row(1, "X", "R001", k * 10, 10)])
+    state = reel_state(db, "R001")
+    assert len(state["segments"]) == 20
+
+    report = submit(
+        db,
+        "NEW",
+        [row(i + 1, f"S{i}", "R001", 50, 100) for i in range(30)],
+    )
+    for shot in report["shots"]:
+        assert len(shot["segments"]) == 1
+        seg = shot["segments"][0]
+        assert (seg["orig_start"], seg["orig_end"]) == (50, 150)
+        assert (seg["arch_start"], seg["arch_end"]) == (50, 150)
+    # The manifest still merges the touched range into one reuse row.
+    assert [(c["orig_start"], c["is_new"]) for c in report["copies"]] == [
+        (50, False)
+    ]
+    assert reel_state(db, "R001")["next_frame"] == 200
+
+
+def test_landing_point_jump_still_cuts_the_read_plan(db):
+    # Existing coverage at orig 0..10 -> arch 0..10, then a gap fill:
+    # orig 10..20 is new and lands at the tail (arch 20..30).  The jump at
+    # orig 10 (arch 10 would be expected for a continuous read) forces a cut.
+    submit(db, "O1", [row(1, "S01", "R001", 0, 10), row(2, "S02", "R001", 20, 10)])
+    report = submit(db, "O2", [row(1, "S03", "R001", 0, 30)])
+    segs = report["shots"][0]["segments"]
+    assert [(s["orig_start"], s["orig_end"], s["arch_start"], s["arch_end"])
+            for s in segs] == [
+        (0, 10, 0, 10),
+        (10, 20, 20, 30),
+        (20, 30, 10, 20),
+    ]
+    # Concatenating the pieces still rebuilds the original frame order.
+    assert [s["orig_start"] for s in segs] == [0, 10, 20]
+
+
+def test_many_shares_of_one_range_do_not_scale_with_index_rows(db):
+    # A fragmented-but-contiguous index (constant offset) shared by many
+    # shots: planning and writing must stay proportional to the shot count,
+    # not shot count times index row count.
+    for k in range(100):
+        submit(db, f"OLD{k}", [row(1, "X", "R001", k * 5, 5)])
+    assert len(reel_state(db, "R001")["segments"]) == 100
+
+    import time
+
+    rows = [row(i + 1, f"S{i}", "R001", 100, 300) for i in range(400)]
+    start = time.monotonic()
+    report = submit(db, "BIG", rows)
+    elapsed = time.monotonic() - start
+    assert elapsed < 5.0
+    assert all(len(shot["segments"]) == 1 for shot in report["shots"])
+    # No new frames: everything was already covered contiguously.
+    assert all(not c["is_new"] for c in report["copies"])
+    assert reel_state(db, "R001")["next_frame"] == 500
+
+    # The stored retrieval plan has exactly one row per shot, regardless of
+    # the 40 index rows each shot spans.
+    import sqlite3
+
+    conn = sqlite3.connect(db)
+    try:
+        stored = conn.execute(
+            "SELECT COUNT(*) FROM shot_segments WHERE order_id = "
+            "(SELECT id FROM orders WHERE order_no = 'BIG')"
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    assert stored == 400
+
+
+def test_old_orders_remain_queryable_after_new_style_submissions(db):
+    first = submit(db, "OLD", [row(1, "S01", "R001", 0, 10)])
+    # A later order that exercises gap fills and read-plan coalescing.
+    submit(db, "NEW", [
+        row(1, "S02", "R001", 5, 20),
+        row(2, "S03", "R001", 0, 25),
+    ])
+    again = get_order(db, "OLD")
+    # The stored order content (copies, shots and retrieval plan) is frozen;
+    # only touched_reels intentionally reports the live reel tail.
+    for key in ("order_no", "film_no", "row_count", "copies", "shots",
+                "created_at"):
+        assert again[key] == first[key]
+    assert again["shots"][0]["segments"] == first["shots"][0]["segments"]
+
+
+def test_reel_index_keeps_first_copy_order_and_landing(db):
+    submit(db, "O1", [row(1, "S01", "R001", 0, 10)])
+    submit(db, "O2", [row(1, "S02", "R001", 10, 10)])
+    state = reel_state(db, "R001")
+    by_orig = {s["orig_start"]: s for s in state["segments"]}
+    assert by_orig[0]["created_order_no"] == "O1"
+    assert by_orig[10]["created_order_no"] == "O2"
+    assert by_orig[0]["arch_start"] == 0
+    assert by_orig[10]["arch_start"] == 10
+    assert state["next_frame"] == 20

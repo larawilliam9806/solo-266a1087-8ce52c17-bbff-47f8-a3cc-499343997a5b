@@ -13,6 +13,14 @@ Invariants
 * ``archive_segments`` is a non-overlapping coverage index from original frame
   intervals to archive frame intervals.  Ranges already present are reused
   exactly where they are; only uncovered gaps are copied.
+* A shot's retrieval plan is cut only at *jump boundaries*: positions where
+  the archive landing point stops being contiguous with the original frame
+  order.  Adjacent index rows that stay contiguous in both frame spaces are
+  one read piece, however many index rows they span.
+* Coverage is planned once per reel over the union of the referenced ranges.
+  The planning and write work is bounded by the coverage-index size and the
+  number of output pieces, never by the product of shot count and index-row
+  count, so many shots sharing one continuous range stay cheap.
 * An order, its copies and its per-shot retrieval plan become visible in one
   transaction.  Any failure rolls the whole submission back, leaving previous
   orders and reel tails untouched.
@@ -63,7 +71,7 @@ class EditRow:
 class _ReelState:
     """In-transaction view of one archive reel and its coverage index."""
 
-    __slots__ = ("reel_id", "orig_reel", "tail", "segments", "starts")
+    __slots__ = ("reel_id", "orig_reel", "tail", "segments", "starts", "jumps")
 
     def __init__(self, reel_id, orig_reel, tail, segments):
         self.reel_id = reel_id
@@ -71,6 +79,8 @@ class _ReelState:
         self.tail = tail
         self.segments = sorted(segments)  # (orig_start, count, arch_start)
         self.starts = [s[0] for s in self.segments]
+        # Original-frame positions where a continuous read must be cut.
+        self.jumps = _jump_boundaries(self.segments)
 
 
 def _now() -> str:
@@ -156,62 +166,114 @@ def _load_reel(conn: sqlite3.Connection, orig_reel: str) -> _ReelState:
     )
 
 
-def _plan_interval(state: _ReelState, start: int, end: int):
-    """Split ``[start, end)`` into ordered, contiguous archive pieces.
+def _jump_boundaries(segments) -> list[int]:
+    """Original-frame positions where a continuous read has to be cut.
 
-    Returns ``(pieces, new_segments)``.  ``pieces`` is an ordered list of
-    ``(orig_start, frame_count, arch_start, is_new)`` covering the whole
-    interval without gaps; ``new_segments`` lists the freshly allocated
-    ``(orig_start, frame_count, arch_start)`` ranges.  Existing coverage is
-    reused in place, uncovered gaps are appended to the reel tail.
+    Two neighbouring coverage rows are readable as one piece only while both
+    the original frame numbers and the archive landing points stay
+    contiguous, i.e. the original->archive offset does not change.  Every
+    other boundary (an archive landing-point jump, including a gap that was
+    filled at the reel tail) is a jump boundary.
     """
-    events = []  # ("gap", s, e) | ("cov", s, e, arch_start)
-    cursor = start
-    idx = bisect.bisect_left(state.starts, start)
-    if idx > 0:
-        prev = state.segments[idx - 1]
-        if prev[0] + prev[1] > start:
-            idx -= 1
-    while idx < len(state.segments):
-        seg_start, seg_count, seg_arch = state.segments[idx]
-        if seg_start >= end:
-            break
-        seg_end = seg_start + seg_count
-        if seg_end > cursor:
-            if seg_start > cursor:
-                events.append(("gap", cursor, min(seg_start, end)))
-            overlap_start = max(seg_start, start)
-            overlap_end = min(seg_end, end)
-            if overlap_end > overlap_start:
-                events.append(
-                    (
-                        "cov",
-                        overlap_start,
-                        overlap_end,
-                        seg_arch + (overlap_start - seg_start),
-                    )
-                )
-            cursor = max(cursor, overlap_end)
-        idx += 1
-    if cursor < end:
-        events.append(("gap", cursor, end))
+    jumps = []
+    for prev, cur in zip(segments, segments[1:]):
+        prev_start, prev_count, prev_arch = prev
+        cur_start, _cur_count, cur_arch = cur
+        if not (
+            cur_start == prev_start + prev_count
+            and cur_arch == prev_arch + prev_count
+        ):
+            jumps.append(cur_start)
+    return jumps
 
-    pieces = []
+
+def _fill_gaps(state: _ReelState, intervals):
+    """Cover the union of ``intervals`` on this reel, appending gaps to tail.
+
+    Planning is done once per reel against the *union* of every frame range
+    the order references, instead of once per shot row against the whole
+    index.  Existing coverage is reused in place; every uncovered gap is
+    allocated one contiguous block at the reel tail and inserted into the
+    coverage index.  Returns the freshly allocated
+    ``(orig_start, frame_count, arch_start)`` ranges.
+
+    The work is bounded by the size of the coverage index plus the number of
+    gaps filled, never by (rows referencing the range) x (index rows inside
+    it): many shots over one already-covered continuous range do no
+    per-index-row work here at all.
+    """
     new_segments = []
     tail = state.tail
-    for event in events:
-        if event[0] == "gap":
-            gap_start, gap_end = event[1], event[2]
-            count = gap_end - gap_start
-            pieces.append((gap_start, count, tail, True))
-            new_segments.append((gap_start, count, tail))
-            bisect.insort(state.segments, (gap_start, count, tail))
-            bisect.insort(state.starts, gap_start)
+    for iv_start, iv_end in _merge_intervals(intervals):
+        idx = bisect.bisect_left(state.starts, iv_start)
+        if idx > 0:
+            prev = state.segments[idx - 1]
+            if prev[0] + prev[1] > iv_start:
+                idx -= 1
+        cursor = iv_start
+        j = idx
+        while j < len(state.segments):
+            seg_start, seg_count, _seg_arch = state.segments[j]
+            if seg_start >= iv_end:
+                break
+            seg_end = seg_start + seg_count
+            if seg_start > cursor:
+                gap_end = min(seg_start, iv_end)
+                count = gap_end - cursor
+                new_segments.append((cursor, count, tail))
+                bisect.insort(state.segments, (cursor, count, tail))
+                bisect.insort(state.starts, cursor)
+                tail += count
+                # The inserted row sits at or before position j; restart the
+                # scan at the first segment starting at or beyond gap_end.
+                j = bisect.bisect_left(state.starts, gap_end, lo=j)
+                cursor = gap_end
+                continue
+            if seg_end > cursor:
+                cursor = min(seg_end, iv_end)
+            j += 1
+        if cursor < iv_end:
+            count = iv_end - cursor
+            new_segments.append((cursor, count, tail))
+            bisect.insort(state.segments, (cursor, count, tail))
+            bisect.insort(state.starts, cursor)
             tail += count
-        else:
-            pieces.append((event[1], event[2] - event[1], event[3], False))
     state.tail = tail
-    return pieces, new_segments
+    state.jumps = _jump_boundaries(state.segments)
+    return new_segments
+
+
+def _shot_pieces(state: _ReelState, start: int, end: int):
+    """Archive read pieces rebuilding ``[start, end)`` in original frame order.
+
+    A new piece starts only at a jump boundary (where the archive landing
+    point stops being contiguous) that falls strictly inside the interval;
+    adjacent coverage rows that stay contiguous in both frame spaces are
+    returned as one read piece no matter how many index rows they span.
+    Both the jump list and the segment index are walked with monotonic
+    cursors, so the cost is linear in the number of output pieces.
+    """
+    pieces = []
+    cursor = start
+    jump_idx = bisect.bisect_right(state.jumps, start)
+    seg_idx = bisect.bisect_right(state.starts, start) - 1
+    while cursor < end:
+        cut = end
+        if jump_idx < len(state.jumps) and state.jumps[jump_idx] < end:
+            cut = state.jumps[jump_idx]
+            jump_idx += 1
+        seg_start, _seg_count, seg_arch = state.segments[seg_idx]
+        pieces.append(
+            (cursor, cut - cursor, seg_arch + (cursor - seg_start))
+        )
+        cursor = cut
+        # Advance to the segment that owns the next cursor position.
+        while (
+            seg_idx + 1 < len(state.segments)
+            and state.segments[seg_idx + 1][0] <= cursor
+        ):
+            seg_idx += 1
+    return pieces
 
 
 def _merge_intervals(intervals):
@@ -229,10 +291,13 @@ def _merge_intervals(intervals):
 
 
 def _coverage_pieces(state, intervals, new_set):
-    """Split referenced intervals along the coverage index.
+    """Split the referenced union along the coverage index.
 
-    Returns ``[(orig_start, count, arch_start, is_new)]``, one entry per
-    coverage segment piece, canonicalised by the union of ``intervals``.
+    Returns ``[(orig_start, count, arch_start, is_new)]``, canonicalised by
+    the union of ``intervals``; neighbours that stay contiguous in both frame
+    spaces are coalesced into one manifest row.  The scan is a single linear
+    walk over the coverage index, independent of how many shots reference
+    each range.
     """
     pieces = []
     idx = 0
@@ -302,6 +367,9 @@ def submit_order(
             )
             order_id = cur.lastrowid
 
+            # Collect every referenced range per reel first, so coverage
+            # planning runs once per reel over the union instead of once per
+            # shot row against the whole index.
             reels: dict[str, _ReelState] = {}
             referenced: dict[str, list[tuple[int, int]]] = {}
             created: dict[str, list[tuple[int, int, int]]] = {}
@@ -310,37 +378,44 @@ def submit_order(
                 if state is None:
                     state = _load_reel(conn, row.orig_reel)
                     reels[row.orig_reel] = state
-
-                pieces, new_segments = _plan_interval(
-                    state, row.orig_start, row.orig_end
-                )
-
-                # Raise the reel tail first so the safety triggers, which
-                # compare against reels.next_frame, accept the new segments.
-                if new_segments:
-                    conn.execute(
-                        "UPDATE reels SET next_frame = ? WHERE id = ?",
-                        (state.tail, state.reel_id),
-                    )
-                    for seg_start, seg_count, seg_arch in new_segments:
-                        conn.execute(
-                            "INSERT INTO archive_segments "
-                            "(reel_id, orig_start, frame_count, arch_start, "
-                            " created_order_id) VALUES (?, ?, ?, ?, ?)",
-                            (
-                                state.reel_id,
-                                seg_start,
-                                seg_count,
-                                seg_arch,
-                                order_id,
-                            ),
-                        )
-
                 referenced.setdefault(row.orig_reel, []).append(
                     (row.orig_start, row.orig_end)
                 )
-                created.setdefault(row.orig_reel, []).extend(new_segments)
 
+            # Phase 1: per reel, reuse the coverage index in place and append
+            # every uncovered gap once, as one contiguous tail block per gap.
+            for orig_reel, intervals in referenced.items():
+                state = reels[orig_reel]
+                new_segments = _fill_gaps(state, intervals)
+                created[orig_reel] = new_segments
+                if not new_segments:
+                    continue
+                # Raise the reel tail first so the safety triggers, which
+                # compare against reels.next_frame, accept the new segments.
+                conn.execute(
+                    "UPDATE reels SET next_frame = ? WHERE id = ?",
+                    (state.tail, state.reel_id),
+                )
+                for seg_start, seg_count, seg_arch in new_segments:
+                    conn.execute(
+                        "INSERT INTO archive_segments "
+                        "(reel_id, orig_start, frame_count, arch_start, "
+                        " created_order_id) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            state.reel_id,
+                            seg_start,
+                            seg_count,
+                            seg_arch,
+                            order_id,
+                        ),
+                    )
+
+            # Phase 2: store the shot rows and their retrieval plans.  A plan
+            # piece is cut only at an archive landing-point jump, so frames
+            # that stay readable as one continuous block are never fragmented
+            # along index-row boundaries.
+            for row in rows:
+                state = reels[row.orig_reel]
                 conn.execute(
                     "INSERT INTO shots "
                     "(order_id, row_index, shot_no, orig_reel, orig_start, "
@@ -355,8 +430,8 @@ def submit_order(
                     ),
                 )
 
-                for seg_index, (piece_start, piece_count, piece_arch, _) in enumerate(
-                    pieces
+                for seg_index, (piece_start, piece_count, piece_arch) in enumerate(
+                    _shot_pieces(state, row.orig_start, row.orig_end)
                 ):
                     conn.execute(
                         "INSERT INTO shot_segments "

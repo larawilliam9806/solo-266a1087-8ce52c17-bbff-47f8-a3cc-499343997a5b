@@ -42,7 +42,9 @@
 
 <section class="card">
   <h2>取帧单：每个镜头的档案读取顺序</h2>
-  <p class="hint">按 seg 顺序读取各档案帧段并依次拼接，即可还原该镜头的原始帧序。</p>
+  <p class="hint">按 seg 顺序读取各档案帧段并依次拼接，即可还原该镜头的原始帧序。
+  仅在档案落点跳转处另起一段：原卷帧号与档案帧号都连续的范围合为一段读取，
+  不再按覆盖索引的条目逐行切开。</p>
   {% for shot in order.shots %}
   <details class="shot" open>
     <summary>

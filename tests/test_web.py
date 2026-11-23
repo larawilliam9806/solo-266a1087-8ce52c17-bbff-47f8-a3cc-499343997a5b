@@ -157,3 +157,38 @@ def test_order_no_with_slash_via_api(client):
     submit(client, "ORD/1", "FILM-A", HEADER + "S01,R001,0,10\n")
     data = client.get("/api/orders/ORD%2F1").get_json()
     assert data["order_no"] == "ORD/1"
+
+
+def test_read_plan_coalesced_on_page_and_api(client):
+    # Two adjacent orders produce two coverage rows with a constant offset.
+    submit(client, "ORD-1", "FILM-A", HEADER + "S01,R001,0,10\n")
+    submit(client, "ORD-2", "FILM-A", HEADER + "S01,R001,10,10\n")
+    submit(client, "ORD-3", "FILM-C", HEADER + "S01,R001,0,20\n")
+
+    data = client.get("/api/orders/ORD-3").get_json()
+    segs = data["shots"][0]["segments"]
+    # One continuous read piece instead of one per coverage index row.
+    assert len(segs) == 1
+    assert (segs[0]["orig_start"], segs[0]["orig_end"]) == (0, 20)
+    assert (segs[0]["arch_start"], segs[0]["arch_end"]) == (0, 20)
+    # The manifest still distinguishes reused frames.
+    assert all(c["is_new"] is False for c in data["copies"])
+
+    page = client.get("/orders/ORD-3").get_data(as_text=True)
+    # Exactly one read row in the retrieval table.
+    assert page.count("[0, 20)") >= 2  # shot range and the single read piece
+    assert "[10, 20)" not in page
+
+
+def test_failed_submission_rolls_back_index_and_tail_via_http(client, app):
+    submit(client, "ORD-1", "FILM-A", HEADER + "S01,R001,0,10\n")
+    before = reel_state(app.config["DATABASE"], "R001")
+    resp = submit(
+        client,
+        "ORD-2",
+        "FILM-B",
+        HEADER + "S01,R001,100,10\nS02,R001,5,0\n",
+    )
+    assert resp.status_code == 400
+    assert reel_state(app.config["DATABASE"], "R001") == before
+    assert client.get("/api/orders/ORD-2").status_code == 404
